@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+Pillow
+numpy
+opencv-python
+insightface
+scipy
+torch
+transformers
+auto-gptq
+optimum
