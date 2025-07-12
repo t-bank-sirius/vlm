@@ -23,10 +23,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-VLM_MODEL_PATH = os.getenv("VLM_MODEL_PATH", "Qwen/Qwen-VL-Chat-Int4")
+VLM_MODEL_PATH = os.getenv("VLM_MODEL_PATH", "/workspaces/doctypehtml/code/model")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
+INSIGHTFACE_ROOT = "/workspaces/doctypehtml/code/.insightface"
 FACE_MODEL_NAME = 'buffalo_l'
 DB_EMBEDDINGS_FILE = 'face_embeddings.npy'
 LABELS_FILE = 'labels.pkl'
@@ -51,7 +52,7 @@ class AnalyzeResponse(BaseModel):
 
 class FaceRecognitionSystem:
     def __init__(self):
-        self.face_app = FaceAnalysis(name=FACE_MODEL_NAME)
+        self.face_app = FaceAnalysis(name=FACE_MODEL_NAME, root=INSIGHTFACE_ROOT)
         self.face_app.prepare(ctx_id=0, det_size=(640, 640))
         self.load_database()
     
@@ -223,9 +224,9 @@ app.add_middleware(
 )
 
 DEFAULT_PROMPT = (
-    "Describe what you see in the photo. Speak like with a person from 8 to 14 years old. "
-    "Speak only English. In math tasks, 'x' is a mathematical variable, not multiplication. "
-    "Example: for 6x + 5 = 23, it's 6x = 23-5 → 6x = 18 → x = 3"
+    "Describe what you see in this picture. "
+    "Speak only English. In math tasks, 'x' is a mathematical variable, not multiplication. Example: 6x + 5 = 23. You dont need to solve them. "
+    "If you see pictures with the content of weapons, drugs, violence, murders, etc., write that this picture contains prohibited content that I cannot describe"
 )
 
 async def generate_description(image_base64: str, prompt: str) -> str:
@@ -249,9 +250,13 @@ async def generate_description(image_base64: str, prompt: str) -> str:
             img.save(tmp, format="JPEG")
             tmp_path = tmp.name
         
+        final_prompt = DEFAULT_PROMPT
+        if prompt and prompt.strip():
+            final_prompt = DEFAULT_PROMPT + " " + prompt.strip()
+        
         query = app.state.tokenizer.from_list_format([
             {'image': tmp_path},
-            {'text': prompt or DEFAULT_PROMPT},
+            {'text': final_prompt},
         ])
         
         with torch.no_grad():
@@ -272,15 +277,6 @@ async def generate_description(image_base64: str, prompt: str) -> str:
             os.unlink(tmp_path)
         logger.error(f"❌ Ошибка генерации описания: {str(e)}")
         return f"Ошибка генерации описания: {str(e)}"
-
-def is_identity_question(prompt: str) -> bool:
-    lower_prompt = prompt.lower()
-    keywords = [
-        "знаешь ли ты его", "кто это", "узнаешь ли ты", 
-        "знаешь ли ты ее", "кто на фото", "это кто",
-        "кто этот человек", "узнаешь этого человека"
-    ]
-    return any(keyword in lower_prompt for keyword in keywords)
 
 @app.post("/add", response_model=FaceAddResponse)
 async def add_face_endpoint(request: FaceAddRequest):
@@ -321,22 +317,21 @@ async def analyze_image(request: AnalyzeRequest):
             processing_time=time.time() - start_time
         )
     
-    if is_identity_question(request.prompt):
-        if recognized_faces:
-            identity_msg = "Я помню этих людей! Это: " + ", ".join(recognized_faces) + ". "
-            
-            description = await generate_description(request.image_base64, request.prompt)
-            
-            return AnalyzeResponse(
-                result=identity_msg + description,
-                processing_time=time.time() - start_time
-            )
-        else:
-            description = await generate_description(request.image_base64, request.prompt)
-            return AnalyzeResponse(
-                result=description,
-                processing_time=time.time() - start_time
-            )
+    if recognized_faces:
+        identity_msg = "Я помню этих людей! Это: " + ", ".join(recognized_faces) + ". "
+        
+        description = await generate_description(request.image_base64, request.prompt)
+        
+        return AnalyzeResponse(
+            result=identity_msg + description,
+            processing_time=time.time() - start_time
+        )
+    else:
+        description = await generate_description(request.image_base64, request.prompt)
+        return AnalyzeResponse(
+            result=description,
+            processing_time=time.time() - start_time
+        )
     
     description = await generate_description(request.image_base64, request.prompt)
     return AnalyzeResponse(
@@ -346,4 +341,4 @@ async def analyze_image(request: AnalyzeRequest):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8001)
