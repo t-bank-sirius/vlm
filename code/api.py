@@ -27,7 +27,6 @@ VLM_MODEL_PATH = os.getenv("VLM_MODEL_PATH", "/app/model")
 VLM_MODEL_PATH = "/app/model"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-
 INSIGHTFACE_ROOT = "/app/.insightface"
 FACE_MODEL_NAME = 'buffalo_l'
 DB_EMBEDDINGS_FILE = 'face_embeddings.npy'
@@ -44,10 +43,17 @@ class AnalyzeRequest(BaseModel):
     image_base64: str
     prompt: str
 
+class SafetyRequest(BaseModel):
+    image_base64: str
+
 class FaceAddResponse(BaseModel):
     result: str
 
 class AnalyzeResponse(BaseModel):
+    result: str
+    processing_time: float
+
+class SafetyResponse(BaseModel):
     result: str
     processing_time: float
 
@@ -228,7 +234,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Multimodal Analysis API",
-    description="API для анализа изображений с поддержкой запоминания лиц и генерации описаний",
+    description="API для анализа изображений с поддержкой запоминания лиц, генерации описаний и проверки безопасности",
     version="1.0.0",
     lifespan=lifespan
 )
@@ -270,6 +276,26 @@ DEFAULT_PROMPT = (
     """
 )
 
+SAFETY_PROMPT = """
+You are a strict content safety analyzer. Your task is to detect any illegal, prohibited, or dangerous content in the image.
+
+Analyze the image for the following content:
+1. Graphic violence, gore, or real blood
+2. Nudity, sexual content, or pornography
+3. Illegal activities (drugs, weapons, terrorist symbols)
+4. Child exploitation content
+5. Hate speech symbols (racist, extremist)
+6. Non-consensual intimate content
+7. Self-harm or suicide content
+
+Rules:
+- Respond only with "SAFE" if image contains NONE of the above
+- Respond with "UNSAFE: <reason>" if ANY prohibited content is detected
+- Be specific about the reason when marking as unsafe
+- Consider even partial matches and subtle representations
+- Better mark as unsafe if uncertain
+"""
+
 async def generate_description(image_base64: str, prompt: str) -> str:
     start_time = time.time()
     
@@ -278,8 +304,8 @@ async def generate_description(image_base64: str, prompt: str) -> str:
     
     tmp_path = None
     try:
-        if ";base64," in image_base64:
-            image_base64 = image_base64.split(";base64,")[1]
+        if ';base64,' in image_base64:
+            image_base64 = image_base64.split(';base64,')[1]
         
         image_data = base64.b64decode(image_base64)
         img = Image.open(io.BytesIO(image_data))
@@ -318,6 +344,51 @@ async def generate_description(image_base64: str, prompt: str) -> str:
             os.unlink(tmp_path)
         logger.error(f"❌ Ошибка генерации описания: {str(e)}")
         return f"Ошибка генерации описания: {str(e)}"
+
+async def check_safety(image_base64: str) -> str:
+    start_time = time.time()
+    
+    if not hasattr(app.state, "model") or not app.state.vlm_loaded:
+        return "UNSAFE: Safety model not loaded"
+    
+    tmp_path = None
+    try:
+        if ';base64,' in image_base64:
+            image_base64 = image_base64.split(';base64,')[1]
+        
+        image_data = base64.b64decode(image_base64)
+        img = Image.open(io.BytesIO(image_data))
+        
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
+            img.save(tmp, format="JPEG")
+            tmp_path = tmp.name
+        
+        query = app.state.tokenizer.from_list_format([
+            {'image': tmp_path},
+            {'text': SAFETY_PROMPT},
+        ])
+        
+        with torch.no_grad():
+            response, _ = app.state.model.chat(
+                tokenizer=app.state.tokenizer,
+                query=query,
+                history=None
+            )
+        
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        
+        logger.info(f"✅ Safety check completed in {time.time() - start_time:.2f}s")
+        return response.strip()
+    
+    except Exception as e:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        logger.error(f"❌ Safety check error: {str(e)}")
+        return f"UNSAFE: Safety check error - {str(e)}"
 
 @app.post("/add", response_model=FaceAddResponse)
 async def add_face_endpoint(request: FaceAddRequest):
@@ -373,6 +444,15 @@ async def analyze_image(request: AnalyzeRequest):
             result=description,
             processing_time=time.time() - start_time
         )
+
+@app.post("/safety", response_model=SafetyResponse)
+async def safety_check(request: SafetyRequest):
+    start_time = time.time()
+    result = await check_safety(request.image_base64)
+    return SafetyResponse(
+        result=result,
+        processing_time=time.time() - start_time
+    )
     
 if __name__ == "__main__":
     import uvicorn
