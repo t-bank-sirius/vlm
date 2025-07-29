@@ -16,6 +16,10 @@ import numpy as np
 from insightface.app import FaceAnalysis
 import pickle
 import numpy.linalg as LA
+import httpx
+
+from dotenv import load_dotenv
+load_dotenv()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -23,28 +27,34 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-VLM_MODEL_PATH = os.getenv("VLM_MODEL_PATH", "/app/model")
-VLM_MODEL_PATH = "/app/model"
+VLM_MODEL_PATH = os.getenv("VLM_MODEL_PATH", "/data/model")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-INSIGHTFACE_ROOT = "/app/.insightface"
+INSIGHTFACE_ROOT = os.getenv("INSIGHTFACE_ROOT", "/data/.insightface")
 FACE_MODEL_NAME = 'buffalo_l'
-DB_EMBEDDINGS_FILE = 'face_embeddings.npy'
-LABELS_FILE = 'labels.pkl'
-EMBEDDING_SIZE = 512
-MAX_FACES_FOR_ADD = 1
-MAX_FACES_FOR_CHECK = 8
+# DB_EMBEDDINGS_FILE = 'face_embeddings.npy'
+# LABELS_FILE = 'labels.pkl'
+USER_DATA_BASE_DIR = "user_data"
+EMBEDDING_SIZE = int(os.getenv("EMBEDDING_SIZE", 512))
+MAX_FACES_FOR_ADD = int(os.getenv("MAX_FACES_FOR_ADD", 1))
+MAX_FACES_FOR_CHECK = int(os.getenv("MAX_FACES_FOR_CHECK", 8))
+
+logger.info(DEVICE)
+
 
 class FaceAddRequest(BaseModel):
     image_base64: str
     comment: str
+    user_id: str
 
 class AnalyzeRequest(BaseModel):
     image_base64: str
     prompt: str
+    user_id: str
 
 class SafetyRequest(BaseModel):
     image_base64: str
+    user_id: str
 
 class FaceAddResponse(BaseModel):
     result: str
@@ -61,24 +71,33 @@ class FaceRecognitionSystem:
     def __init__(self):
         self.face_app = FaceAnalysis(name=FACE_MODEL_NAME, root=INSIGHTFACE_ROOT)
         self.face_app.prepare(ctx_id=0, det_size=(640, 640))
-        self.load_database()
+        # self.load_database() # Database will be loaded on demand per user
     
-    def load_database(self):
-        if os.path.exists(DB_EMBEDDINGS_FILE) and os.path.exists(LABELS_FILE):
-            self.face_embeddings = np.load(DB_EMBEDDINGS_FILE)
-            with open(LABELS_FILE, 'rb') as f:
-                self.face_labels = pickle.load(f)
-            logger.info(f"База лиц загружена: {len(self.face_labels)} записей")
+    def _get_user_data_paths(self, user_id):
+        user_dir = os.path.join(USER_DATA_BASE_DIR, user_id)
+        os.makedirs(user_dir, exist_ok=True)
+        db_path = os.path.join(user_dir, "face_embeddings.npy")
+        labels_path = os.path.join(user_dir, "labels.pkl")
+        return db_path, labels_path
+
+    def load_database(self, user_id):
+        db_path, labels_path = self._get_user_data_paths(user_id)
+        if os.path.exists(db_path) and os.path.exists(labels_path):
+            face_embeddings = np.load(db_path)
+            with open(labels_path, 'rb') as f:
+                face_labels = pickle.load(f)
+            logger.info(f"База лиц для пользователя {user_id} загружена: {len(face_labels)} записей")
+            return face_embeddings, face_labels
         else:
-            self.face_embeddings = np.empty((0, EMBEDDING_SIZE), dtype=np.float32)
-            self.face_labels = []
-            logger.info("Создана новая база лиц")
+            logger.info(f"Создана новая база лиц для пользователя {user_id}")
+            return np.empty((0, EMBEDDING_SIZE), dtype=np.float32), []
     
-    def save_database(self):
-        np.save(DB_EMBEDDINGS_FILE, self.face_embeddings)
-        with open(LABELS_FILE, 'wb') as f:
-            pickle.dump(self.face_labels, f)
-        logger.info("База лиц сохранена")
+    def save_database(self, user_id, face_embeddings, face_labels):
+        db_path, labels_path = self._get_user_data_paths(user_id)
+        np.save(db_path, face_embeddings)
+        with open(labels_path, 'wb') as f:
+            pickle.dump(face_labels, f)
+        logger.info(f"База лиц для пользователя {user_id} сохранена")
     
     def base64_to_image(self, base64_str):
         try:
@@ -126,10 +145,12 @@ class FaceRecognitionSystem:
             logger.error(f"Ошибка обработки изображения: {str(e)}")
             return [], "Ошибка обработки изображения"
     
-    def add_face(self, base64_str, comment):
+    async def add_face(self, user_id, base64_str, comment):
         if not comment or comment.strip() == "":
             return "Комментарий не может быть пустым"
         
+        face_embeddings, face_labels = self.load_database(user_id)
+
         image = self.base64_to_image(base64_str)
         if image is None:
             return "Невозможно декодировать изображение из base64"
@@ -138,41 +159,65 @@ class FaceRecognitionSystem:
         if error:
             return error
         
-        if len(self.face_labels) > 0:
-            if len(self.face_labels) != len(self.face_embeddings):
+        if len(face_labels) > 0:
+            if len(face_labels) != len(face_embeddings):
                 logger.error(
-                    f"Несоответствие базы: метки={len(self.face_labels)}, эмбеддинги={len(self.face_embeddings)}"
+                    f"Несоответствие базы для пользователя {user_id}: метки={len(face_labels)}, эмбеддинги={len(face_embeddings)}"
                 )
-                min_length = min(len(self.face_labels), len(self.face_embeddings))
-                self.face_labels = self.face_labels[:min_length]
-                self.face_embeddings = self.face_embeddings[:min_length]
-                self.save_database()
-                logger.warning(f"База автоматически исправлена до {min_length} записей")
+                min_length = min(len(face_labels), len(face_embeddings))
+                face_labels = face_labels[:min_length]
+                face_embeddings = face_embeddings[:min_length]
+                self.save_database(user_id, face_embeddings, face_labels)
+                logger.warning(f"База для пользователя {user_id} автоматически исправлена до {min_length} записей")
             
-            dists = LA.norm(self.face_embeddings - np.array(embedding).reshape(1, -1), axis=1)
+            dists = LA.norm(face_embeddings - np.array(embedding).reshape(1, -1), axis=1)
             min_dist = np.min(dists)
             if min_dist < 0.5:
                 duplicate_index = np.argmin(dists)
                 
-                if duplicate_index < len(self.face_labels):
-                    duplicate_name = self.face_labels[duplicate_index]
+                if duplicate_index < len(face_labels):
+                    duplicate_name = face_labels[duplicate_index]
                     return f"Человек уже существует в базе как '{duplicate_name}'"
                 else:
                     logger.error(
-                        f"Ошибка индекса: {duplicate_index} (размер меток: {len(self.face_labels)})"
+                        f"Ошибка индекса для пользователя {user_id}: {duplicate_index} (размер меток: {len(face_labels)})"
                     )
                     return "Ошибка: несоответствие данных в базе лиц"
         
         try:
-            self.face_embeddings = np.vstack([self.face_embeddings, np.array(embedding).reshape(1, -1)])
-            self.face_labels.append(comment)
-            self.save_database()
-            return f"Ok! I'll remember that it's {comment}"
+            face_embeddings = np.vstack([face_embeddings, np.array(embedding).reshape(1, -1)])
+            face_labels.append(comment)
+            self.save_database(user_id, face_embeddings, face_labels)
+            local_result = f"Ok! I'll remember that it's {comment}"
         except Exception as e:
-            logger.error(f"Ошибка добавления лица: {str(e)}")
-            return "Невозможно добавить лицо в базу"
+            logger.error(f"Ошибка добавления лица для пользователя {user_id}: {str(e)}")
+            local_result = "Невозможно добавить лицо в базу"
+
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    "http://ltm-api:8006/add_face",
+                    json={
+                        "user_id": user_id,
+                        "name": comment,
+                        "image": base64_str
+                    },
+                    timeout=30.0
+                )
+                response.raise_for_status()
+                logger.info(f"Запрос к LTM API успешен: {response.json()}")
+                return local_result
+        except httpx.RequestError as e:
+            logger.error(f"Ошибка запроса к LTM API: {e}")
+            return f"{local_result}. Ошибка при синхронизации с LTM API: {e}"
+        except httpx.HTTPStatusError as e:
+            logger.error(f"Ошибка HTTP статуса от LTM API: {e.response.status_code} - {e.response.text}")
+            return f"{local_result}. Ошибка HTTP от LTM API: {e.response.status_code}"
+        except Exception as e:
+            logger.error(f"Неизвестная ошибка при вызове LTM API: {e}")
+            return f"{local_result}. Неизвестная ошибка при синхронизации с LTM API: {e}"
     
-    def recognize_faces(self, base64_str):
+    def recognize_faces(self, user_id, base64_str):
         image = self.base64_to_image(base64_str)
         if image is None:
             return [], "Невозможно декодировать изображение из base64"
@@ -181,19 +226,21 @@ class FaceRecognitionSystem:
         if error:
             return [], error
         
-        if len(self.face_labels) == 0:
+        face_embeddings, face_labels = self.load_database(user_id)
+
+        if len(face_labels) == 0:
             return [], "База данных лиц пуста"
         
         results = []
         for embedding in embeddings:
-            dists = LA.norm(self.face_embeddings - np.array(embedding).reshape(1, -1), axis=1)
+            dists = LA.norm(face_embeddings - np.array(embedding).reshape(1, -1), axis=1)
             min_index = np.argmin(dists)
             min_dist = dists[min_index]
             
             if min_dist < 0.7:
                 confidence = max(0, 100 - min_dist * 100)
                 results.append({
-                    "name": self.face_labels[min_index],
+                    "name": face_labels[min_index],
                     "confidence": confidence
                 })
         
@@ -397,7 +444,7 @@ async def add_face_endpoint(request: FaceAddRequest):
     if not app.state.face_recognition_loaded or not app.state.face_system:
         return FaceAddResponse(result="Система распознавания лиц не инициализирована")
     
-    result = app.state.face_system.add_face(request.image_base64, request.comment)
+    result = await app.state.face_system.add_face(request.user_id, request.image_base64, request.comment)
     
     return FaceAddResponse(
         result=result,
@@ -418,7 +465,7 @@ async def analyze_image(request: AnalyzeRequest):
             if embeddings:
                 face_detection_result = f"Обнаружено лиц: {len(embeddings)}"
                 
-                recognized, _ = app.state.face_system.recognize_faces(request.image_base64)
+                recognized, _ = app.state.face_system.recognize_faces(request.user_id, request.image_base64)
                 if recognized:
                     recognized_faces = [f"{face['name']}" for face in recognized]
     
